@@ -9697,11 +9697,12 @@ static ssize_t ds5_dfu_device_read(struct file *flip,
 			(fw_build >> 8) & 0xff, fw_build & 0xff);
 	}
 
-	if (copy_to_user(buffer, msg, strlen(msg)))
+	len = min(len, strlen(msg));
+	if (copy_to_user(buffer, msg, len))
 		ret = -EFAULT;
 	else {
 		state->dfu_dev.msg_write_once = ~state->dfu_dev.msg_write_once;
-		ret = strlen(msg) & state->dfu_dev.msg_write_once;
+		ret = len & state->dfu_dev.msg_write_once;
 	}
 
 e_dfu_read_failed:
