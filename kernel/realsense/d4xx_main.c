@@ -9492,14 +9492,20 @@ static int ds5_parse_cam(struct i2c_client *client, struct ds5 *state)
 	return 0;
 }
 
-static void ds5_mux_remove(struct ds5 *state)
+/* Undo ds5_mux_init() for a mux that was never async-registered. */
+static void ds5_mux_cleanup(struct ds5 *state)
 {
 #ifdef CONFIG_TEGRA_CAMERA_PLATFORM
 	camera_common_cleanup(&state->mux.sd);
 #endif
-	v4l2_async_unregister_subdev(&state->mux.sd.subdev);
 	v4l2_ctrl_handler_free(state->mux.sd.subdev.ctrl_handler);
 	media_entity_cleanup(&state->mux.sd.subdev.entity);
+}
+
+static void ds5_mux_remove(struct ds5 *state)
+{
+	v4l2_async_unregister_subdev(&state->mux.sd.subdev);
+	ds5_mux_cleanup(state);
 }
 
 static const struct regmap_config ds5_regmap_config = {
@@ -10064,7 +10070,7 @@ static int ds5_v4l_init(struct i2c_client *c, struct ds5 *state)
 
 	return 0;
 e_mux:
-	ds5_mux_remove(state);
+	ds5_mux_cleanup(state);
 e_imu:
 	media_entity_cleanup(&state->imu.sensor.sd.entity);
 e_rgb:
