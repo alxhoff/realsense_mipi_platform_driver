@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexander Hoffman <alxhoff@gmail.com>
+Date: Thu, 19 Nov 2026 13:03:28 +0100
+Subject: [PATCH] media: i2c: max9296: fix sources[] overflow and unpacked
+ entries after unregister
+
+- max9296_sdev_register() checks num_src > max_src, so with max_src ==
+  MAX9296_MAX_SOURCES (2) a third registration writes sources[2], past
+  the end of the array and onto priv->lock. A repeated registration
+  (e.g. a d4xx probe that fails after registering, then re-probes) is
+  enough to trigger it.
+- max9296_sdev_unregister() NULLs the matching entry without packing the
+  array, so loops over sources[0..num_src) then dereference a NULL g_ctx
+  and the last source is dropped. Move the last entry into the freed slot.
+- max9296_get_sdev_idx() scans up to max_src and dereferences unused
+  (NULL) entries when fewer sources are registered; scan num_src.
+
+---
+ drivers/media/i2c/max9296.c | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/media/i2c/max9296.c b/drivers/media/i2c/max9296.c
+index d1c36ae06..9beaa94e3 100644
+--- a/drivers/media/i2c/max9296.c
++++ b/drivers/media/i2c/max9296.c
+@@ -178,11 +178,11 @@ static int max9296_get_sdev_idx(struct device *dev,
+ 	int err = 0;
+ 
+ 	mutex_lock(&priv->lock);
+-	for (i = 0; i < priv->max_src; i++) {
++	for (i = 0; i < priv->num_src; i++) {
+ 		if (priv->sources[i].g_ctx->s_dev == s_dev)
+ 			break;
+ 	}
+-	if (i == priv->max_src) {
++	if (i == priv->num_src) {
+ 		dev_err(dev, "no sdev found\n");
+ 		err = -EINVAL;
+ 		goto ret;
+@@ -465,7 +465,7 @@ int max9296_sdev_register(struct device *dev, struct gmsl_link_ctx *g_ctx)
+ 
+ 	mutex_lock(&priv->lock);
+ 
+-	if (priv->num_src > priv->max_src) {
++	if (priv->num_src >= priv->max_src) {
+ 		dev_err(dev,
+ 			"%s: MAX9296 inputs size exhausted\n", __func__);
+ 		err = -ENOMEM;
+@@ -540,10 +540,8 @@ int max9296_sdev_unregister(struct device *dev, struct device *s_dev)
+ 	}
+ 
+ 	for (i = 0; i < priv->num_src; i++) {
+-		if (s_dev == priv->sources[i].g_ctx->s_dev) {
+-			priv->sources[i].g_ctx = NULL;
++		if (s_dev == priv->sources[i].g_ctx->s_dev)
+ 			break;
+-		}
+ 	}
+ 
+ 	if (i == priv->num_src) {
+@@ -552,7 +550,11 @@ int max9296_sdev_unregister(struct device *dev, struct device *s_dev)
+ 		err = -EINVAL;
+ 		goto error;
+ 	}
++	/* Keep sources[0..num_src) packed: loops dereference every g_ctx */
+ 	priv->num_src--;
++	priv->sources[i] = priv->sources[priv->num_src];
++	priv->sources[priv->num_src].g_ctx = NULL;
++	priv->sources[priv->num_src].st_enabled = false;
+ 
+ error:
+ 	mutex_unlock(&priv->lock);
+-- 
+2.43.0
+
