@@ -304,9 +304,8 @@ struct ser_interface {
 #define DFU_WAIT_RET_LEN 6
 
 /*
- * Deadline for the D58x manifest wait; the manifest can legitimately take
- * up to ~90 s, so the bound is generous and only guards against a device
- * stuck in an intermediate manifest state.
+ * Deadline for one DFU status wait; the D58x manifest can legitimately take
+ * up to ~90 s, so the bound is generous and only guards against a stuck device.
  */
 #define DFU_MANIFEST_TIMEOUT_MS 180000
 
@@ -9558,12 +9557,18 @@ static int ds5_dfu_wait_for_get_dfu_status(struct ds5 *state,
 	u16 status, dfu_state_len = 0x0000;
 	unsigned char dfu_asw_buf[DFU_WAIT_RET_LEN];
 	unsigned int dfu_wr_wait_msec = 0;
-	unsigned long manifest_deadline = jiffies +
+	unsigned long deadline = jiffies +
 			msecs_to_jiffies(DFU_MANIFEST_TIMEOUT_MS);
 
 	do {
 		ds5_write_with_check(state, 0x5008, 0x0003); // Get Write state
 		do {
+			if (time_after(jiffies, deadline)) {
+				dev_err(&state->client->dev,
+						"%s(): timeout waiting for dfu_state %d\n",
+						__func__, exp_state);
+				return -ETIMEDOUT;
+			}
 			ds5_read_with_check(state, 0x5000, &status);
 			if (status == 0x0001) {
 				dev_err(&state->client->dev,
@@ -9571,8 +9576,8 @@ static int ds5_dfu_wait_for_get_dfu_status(struct ds5 *state,
 						__func__);
 				return -EINVAL;
 			} else
-				if (status == 0x0002 && dfu_wr_wait_msec)
-					msleep_range(dfu_wr_wait_msec);
+				if (status == 0x0002)
+					msleep_range(clamp(dfu_wr_wait_msec, 1U, 1000U));
 
 		} while (status);
 
@@ -9595,14 +9600,14 @@ static int ds5_dfu_wait_for_get_dfu_status(struct ds5 *state,
 	 * D58x manifestation runs dfuMANIFEST_SYNC -> dfuMANIFEST ->
 	 * dfuMANIFEST_WAIT_RESET; keep polling through the intermediate
 	 * states until the terminal wait-reset state is reached, bounded by
-	 * manifest_deadline so a stuck device errors out instead of hanging.
+	 * deadline so a stuck device errors out instead of hanging.
 	 */
 	} while ((dfu_asw_buf[4] == dfuDNBUSY &&
 		  exp_state == dfuDNLOAD_IDLE) ||
 		 ((dfu_asw_buf[4] == dfuMANIFEST_SYNC ||
 		   dfu_asw_buf[4] == dfuMANIFEST) &&
 		  exp_state == dfuMANIFEST_WAIT_RESET &&
-		  time_before(jiffies, manifest_deadline)));
+		  time_before(jiffies, deadline)));
 
 	if (dfu_asw_buf[4] != exp_state) {
 		dev_notice(&state->client->dev,
