@@ -24,7 +24,6 @@
 
 /* Only what the declarations below need; each .c includes what its code uses. */
 #include <linux/atomic.h>	/* atomic_t in struct ds5_dev */
-#include <linux/cdev.h>		/* struct cdev in struct ds5_dfu_dev */
 #include <linux/mutex.h>
 #include <linux/types.h>
 #include <media/media-entity.h>
@@ -225,10 +224,10 @@ struct ds5_mux_subdev {
 #endif
 
 struct ds5_dfu_status;
+struct ds5_dfu_cdev;
 
 struct ds5_dfu_dev {
-	struct cdev ds5_cdev;
-	struct class *ds5_class;
+	struct ds5_dfu_cdev *cdev_ctx;
 	int device_open_count;
 	enum dfu_state dfu_state_flag;
 	enum dfu_fw_state manifest_state;
