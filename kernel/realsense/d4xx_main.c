@@ -19,10 +19,12 @@
  */
 
 #include <linux/bitops.h>
+#include <linux/cdev.h>
 #include <linux/delay.h>
 #include <linux/gpio.h>
 #include <linux/i2c.h>
 #include <linux/kernel.h>
+#include <linux/kref.h>
 #include <linux/media.h>
 #include <linux/module.h>
 #include <linux/of_gpio.h>
@@ -9663,18 +9665,74 @@ static int ds5_dfu_detach(struct ds5 *state)
 	return ret;
 };
 
+/* Open files outlive the devm-allocated struct ds5 across unbind, so they
+ * reference this context instead; remove() clears @state under @rwsem.
+ */
+struct ds5_dfu_cdev {
+	struct kref ref;
+	struct rw_semaphore rwsem;	/* file ops: read, remove: write */
+	struct ds5 *state;
+	struct cdev *cdev;
+	dev_t devt;
+	struct list_head node;
+};
+
+static LIST_HEAD(ds5_dfu_cdevs);
+static struct class *g_ds5_class;
+static unsigned int ds5_dfu_class_users;
+/* Protects ds5_dfu_cdevs, g_ds5_class and ds5_dfu_class_users */
+static DEFINE_MUTEX(ds5_dfu_cdevs_lock);
+
+static void ds5_dfu_cdev_free(struct kref *ref)
+{
+	kfree(container_of(ref, struct ds5_dfu_cdev, ref));
+}
+
+static struct ds5_dfu_cdev *ds5_dfu_cdev_get(dev_t devt)
+{
+	struct ds5_dfu_cdev *ctx;
+
+	mutex_lock(&ds5_dfu_cdevs_lock);
+	list_for_each_entry(ctx, &ds5_dfu_cdevs, node) {
+		if (ctx->devt == devt) {
+			kref_get(&ctx->ref);
+			mutex_unlock(&ds5_dfu_cdevs_lock);
+			return ctx;
+		}
+	}
+	mutex_unlock(&ds5_dfu_cdevs_lock);
+	return NULL;
+}
+
+/* On success the caller holds ctx->rwsem for read and must up_read() it. */
+static struct ds5 *ds5_dfu_get_state(struct ds5_dfu_cdev *ctx)
+{
+	down_read(&ctx->rwsem);
+	if (!ctx->state) {
+		up_read(&ctx->rwsem);
+		return NULL;
+	}
+	return ctx->state;
+}
+
 /* When a process reads from our device, this gets called. */
 static ssize_t ds5_dfu_device_read(struct file *flip,
 		char __user *buffer, size_t len, loff_t *offset)
 {
-	struct ds5 *state = flip->private_data;
+	struct ds5_dfu_cdev *ctx = flip->private_data;
+	struct ds5 *state;
 	u16 fw_ver, fw_build;
 	char msg[64];
 	int ret = 0;
 	struct __fw_status f = {0};
 
-	if (mutex_lock_interruptible(&state->lock))
+	state = ds5_dfu_get_state(ctx);
+	if (!state)
+		return -ENODEV;
+	if (mutex_lock_interruptible(&state->lock)) {
+		up_read(&ctx->rwsem);
 		return -ERESTARTSYS;
+	}
 	if (state->dfu_dev.dfu_state_flag == DS5_DFU_RECOVERY) {
 		/* Read device info in recovery mode */
 		ret = ds5_dfu_detach(state);
@@ -9706,6 +9764,7 @@ static ssize_t ds5_dfu_device_read(struct file *flip,
 
 e_dfu_read_failed:
 	mutex_unlock(&state->lock);
+	up_read(&ctx->rwsem);
 	return ret;
 };
 
@@ -9737,17 +9796,24 @@ static int ds5_dfu_finalize_download(struct ds5 *state)
 static ssize_t ds5_dfu_device_write(struct file *flip,
 		const char __user *buffer, size_t len, loff_t *offset)
 {
-	struct ds5 *state = flip->private_data;
+	struct ds5_dfu_cdev *ctx = flip->private_data;
+	struct ds5 *state;
 	int ret = 0;
 	(void)offset;
 
-	if (mutex_lock_interruptible(&state->lock))
+	state = ds5_dfu_get_state(ctx);
+	if (!state)
+		return -ENODEV;
+	if (mutex_lock_interruptible(&state->lock)) {
+		up_read(&ctx->rwsem);
 		return -ERESTARTSYS;
+	}
 	/* Only the new Fm+ path waits for a nonempty image write.
 	 * Preserve legacy zero-length write behaviour.
 	 */
 	if (!len && d5xx_i2c_fast_plus_capable(state)) {
 		mutex_unlock(&state->lock);
+		up_read(&ctx->rwsem);
 		return 0;
 	}
 	if (state->dfu_dev.dfu_state_flag == DS5_DFU_OPEN ||
@@ -9755,6 +9821,7 @@ static ssize_t ds5_dfu_device_write(struct file *flip,
 		ret = ds5_dfu_session_begin(state);
 		if (ret) {
 			mutex_unlock(&state->lock);
+			up_read(&ctx->rwsem);
 			return ret;
 		}
 		WRITE_ONCE(state->dfu_dev.manifest_complete, false);
@@ -9827,6 +9894,7 @@ static ssize_t ds5_dfu_device_write(struct file *flip,
 
 	};
 	mutex_unlock(&state->lock);
+	up_read(&ctx->rwsem);
 	return len;
 
 dfu_write_error:
@@ -9836,25 +9904,37 @@ dfu_write_error:
 		state->dfu_dev.dfu_state_flag = DS5_DFU_IDLE;
 	ds5_dfu_session_end(state);
 	mutex_unlock(&state->lock);
+	up_read(&ctx->rwsem);
 	return ret;
 };
 
 static int ds5_dfu_device_open(struct inode *inode, struct file *file)
 {
-	struct ds5 *state = container_of(inode->i_cdev, struct ds5,
-			dfu_dev.ds5_cdev);
+	struct ds5_dfu_cdev *ctx;
+	struct ds5 *state;
 	int ret;
+
+	ctx = ds5_dfu_cdev_get(inode->i_rdev);
+	if (!ctx)
+		return -ENODEV;
+	state = ds5_dfu_get_state(ctx);
+	if (!state) {
+		ret = -ENODEV;
+		goto e_put;
+	}
 
 	/* Enumeration may probe an updating camera on its way to another one.
 	 * Do not wait behind the full-image write just to reject an exclusive
 	 * open. Recheck under the lock to serialize competing first opens.
 	 */
-	if (READ_ONCE(state->dfu_dev.device_open_count))
-		return -EBUSY;
+	if (READ_ONCE(state->dfu_dev.device_open_count)) {
+		ret = -EBUSY;
+		goto e_up;
+	}
 	mutex_lock(&state->lock);
 	if (state->dfu_dev.device_open_count) {
-		mutex_unlock(&state->lock);
-		return -EBUSY;
+		ret = -EBUSY;
+		goto e_unlock;
 	}
 
 	/*
@@ -9866,8 +9946,8 @@ static int ds5_dfu_device_open(struct inode *inode, struct file *file)
 	state->dfu_dev.dfu_msg = devm_kzalloc(&state->client->dev,
 			DFU_BLOCK_SIZE, GFP_KERNEL);
 	if (!state->dfu_dev.dfu_msg) {
-		mutex_unlock(&state->lock);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto e_unlock;
 	}
 	/* Keep the existing 400 kHz open behavior. D585 information queries
 	 * must not start a 980 kHz session; its first image write does that.
@@ -9877,25 +9957,37 @@ static int ds5_dfu_device_open(struct inode *inode, struct file *file)
 		if (ret) {
 			devm_kfree(&state->client->dev, state->dfu_dev.dfu_msg);
 			state->dfu_dev.dfu_msg = NULL;
-			mutex_unlock(&state->lock);
-			return ret;
+			goto e_unlock;
 		}
 	}
 	/* A failed open has no release callback: preserve its entry state. */
 	if (state->dfu_dev.dfu_state_flag != DS5_DFU_RECOVERY)
 		state->dfu_dev.dfu_state_flag = DS5_DFU_OPEN;
 	WRITE_ONCE(state->dfu_dev.device_open_count, 1);
-	file->private_data = state;
+	file->private_data = ctx;
 	mutex_unlock(&state->lock);
+	up_read(&ctx->rwsem);
 	return 0;
+
+e_unlock:
+	mutex_unlock(&state->lock);
+e_up:
+	up_read(&ctx->rwsem);
+e_put:
+	kref_put(&ctx->ref, ds5_dfu_cdev_free);
+	return ret;
 };
 
 static int ds5_dfu_device_flush(struct file *file, fl_owner_t id)
 {
-	struct ds5 *state = file->private_data;
+	struct ds5_dfu_cdev *ctx = file->private_data;
+	struct ds5 *state;
 	int ret = 0;
 
 	(void)id;
+	state = ds5_dfu_get_state(ctx);
+	if (!state)
+		return 0;
 	mutex_lock(&state->lock);
 	/* A partial block finalizes in write(). Use close as the end signal for an
 	 * aligned image because userspace may split it across multiple writes.
@@ -9912,6 +10004,7 @@ static int ds5_dfu_device_flush(struct file *file, fl_owner_t id)
 	if (ret)
 		ds5_dfu_session_end(state);
 	mutex_unlock(&state->lock);
+	up_read(&ctx->rwsem);
 
 	return ret;
 }
@@ -10078,8 +10171,13 @@ e_depth:
 
 static int ds5_dfu_device_release(struct inode *inode, struct file *file)
 {
-	struct ds5 *state = container_of(inode->i_cdev, struct ds5, dfu_dev.ds5_cdev);
+	struct ds5_dfu_cdev *ctx = file->private_data;
+	struct ds5 *state;
 	int ret = 0, retry = 10;
+
+	state = ds5_dfu_get_state(ctx);
+	if (!state)
+		goto e_put;
 	mutex_lock(&state->lock);
 	WRITE_ONCE(state->dfu_dev.device_open_count,
 		   state->dfu_dev.device_open_count - 1);
@@ -10095,10 +10193,8 @@ static int ds5_dfu_device_release(struct inode *inode, struct file *file)
 		devm_kfree(&state->client->dev, state->dfu_dev.dfu_msg);
 	state->dfu_dev.dfu_msg = NULL;
 	ret = ds5_dfu_session_end(state);
-	if (ret) {
-		mutex_unlock(&state->lock);
-		return ret;
-	}
+	if (ret)
+		goto e_unlock;
 	/* Verify communication */
 	do {
 		ret = ds5_read(state, DS5_FW_VERSION, &state->fw_version);
@@ -10108,11 +10204,14 @@ static int ds5_dfu_device_release(struct inode *inode, struct file *file)
 	if (ret) {
 		dev_warn(&state->client->dev,
 			"%s(): no communication with d4xx\n", __func__);
-		mutex_unlock(&state->lock);
-		return ret;
+		goto e_unlock;
 	}
 	ret = ds5_read(state, DS5_FW_BUILD, &state->fw_build);
+e_unlock:
 	mutex_unlock(&state->lock);
+	up_read(&ctx->rwsem);
+e_put:
+	kref_put(&ctx->ref, ds5_dfu_cdev_free);
 	return ret;
 };
 
@@ -10125,55 +10224,80 @@ static const struct file_operations ds5_device_file_ops = {
 	.release = &ds5_dfu_device_release
 };
 
-struct class *g_ds5_class;
-atomic_t primary_chardev = ATOMIC_INIT(0);
+/* Caller holds ds5_dfu_cdevs_lock */
+static void ds5_dfu_class_put(void)
+{
+	if (--ds5_dfu_class_users)
+		return;
+	class_destroy(g_ds5_class);
+	g_ds5_class = NULL;
+}
 
 static int ds5_chrdev_init(struct i2c_client *c, struct ds5 *state)
 {
-	struct cdev *ds5_cdev = &state->dfu_dev.ds5_cdev;
-	struct class **ds5_class = &state->dfu_dev.ds5_class;
+	struct ds5_dfu_cdev *ctx;
 #ifndef CONFIG_OF
 	struct d4xx_pdata *pdata = c->dev.platform_data;
 	char suffix = pdata->suffix;
 #endif
 	struct device *chr_dev;
 	char dev_name[sizeof(DS5_DRIVER_NAME_DFU) + 8];
-	dev_t *dev_num = &c->dev.devt;
 	int ret;
 
 	dev_dbg(&c->dev, "%s()\n", __func__);
-	/* Request the kernel for N_MINOR devices */
-	ret = alloc_chrdev_region(dev_num, 0, 1, DS5_DRIVER_NAME_DFU);
-	if (ret < 0)
-		return ret;
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+	kref_init(&ctx->ref);
+	init_rwsem(&ctx->rwsem);
+	ctx->state = state;
 
-	if (!atomic_read(&primary_chardev)) {
-		dev_dbg(&c->dev, "%s(): <Major, Minor>: <%d, %d>\n",
-				__func__, MAJOR(*dev_num), MINOR(*dev_num));
+	/* Request the kernel for N_MINOR devices */
+	ret = alloc_chrdev_region(&ctx->devt, 0, 1, DS5_DRIVER_NAME_DFU);
+	if (ret < 0)
+		goto e_free;
+	dev_dbg(&c->dev, "%s(): <Major, Minor>: <%d, %d>\n",
+			__func__, MAJOR(ctx->devt), MINOR(ctx->devt));
+
+	/* Not embedded in state: open files can pin the cdev past remove(). */
+	ctx->cdev = cdev_alloc();
+	if (!ctx->cdev) {
+		ret = -ENOMEM;
+		goto e_region;
+	}
+	ctx->cdev->owner = THIS_MODULE;
+	ctx->cdev->ops = &ds5_device_file_ops;
+
+	mutex_lock(&ds5_dfu_cdevs_lock);
+	if (!ds5_dfu_class_users) {
 		/* Create a class : appears at /sys/class */
 #if defined(NV_CLASS_CREATE_HAS_NO_OWNER_ARG)
 		/* conftest: kernel's class_create() dropped the owner arg (single-arg form).
 		 * NVIDIA's L4T R39.2 (JetPack 7.2) defines this on its 6.8 kernel. */
-		*ds5_class = class_create(DS5_DRIVER_NAME_CLASS);
+		g_ds5_class = class_create(DS5_DRIVER_NAME_CLASS);
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
-		*ds5_class = class_create(THIS_MODULE, DS5_DRIVER_NAME_CLASS);
+		g_ds5_class = class_create(THIS_MODULE, DS5_DRIVER_NAME_CLASS);
 #else
-		*ds5_class = class_create(DS5_DRIVER_NAME_CLASS);
+		g_ds5_class = class_create(DS5_DRIVER_NAME_CLASS);
 #endif
 		dev_warn(&state->client->dev, "%s() class_create\n", __func__);
-		if (IS_ERR(*ds5_class)) {
+		if (IS_ERR(g_ds5_class)) {
+			ret = PTR_ERR(g_ds5_class);
+			g_ds5_class = NULL;
+			mutex_unlock(&ds5_dfu_cdevs_lock);
 			dev_err(&c->dev, "Could not create class device\n");
-			unregister_chrdev_region(0, 1);
-			ret = PTR_ERR(*ds5_class);
-			return ret;
+			goto e_cdev;
 		}
-		g_ds5_class = *ds5_class;
-	} else
-		*ds5_class = g_ds5_class;
-	/* Associate the cdev with a set of file_operations */
-	cdev_init(ds5_cdev, &ds5_device_file_ops);
-	/* Build up the current device number. To be used further */
-	*dev_num = MKDEV(MAJOR(*dev_num), MINOR(*dev_num));
+	}
+	ds5_dfu_class_users++;
+	list_add(&ctx->node, &ds5_dfu_cdevs);
+	mutex_unlock(&ds5_dfu_cdevs_lock);
+
+	ret = cdev_add(ctx->cdev, ctx->devt, 1);
+	if (ret) {
+		dev_err(&c->dev, "Could not add cdev (%d)\n", ret);
+		goto e_unlist;
+	}
 	/* Create a device node for this device. */
 #ifndef CONFIG_OF
 	if (state->aggregated)
@@ -10184,34 +10308,55 @@ static int ds5_chrdev_init(struct i2c_client *c, struct ds5 *state)
 	snprintf (dev_name, sizeof(dev_name), "%s-%d-%04x",
 			DS5_DRIVER_NAME_DFU, i2c_adapter_id(c->adapter), c->addr);
 #endif
-	chr_dev = device_create(*ds5_class, NULL, *dev_num, NULL, dev_name);
+	chr_dev = device_create(g_ds5_class, NULL, ctx->devt, NULL, dev_name);
 	if (IS_ERR(chr_dev)) {
 		ret = PTR_ERR(chr_dev);
 		dev_err(&c->dev, "Could not create device\n");
-		class_destroy(*ds5_class);
-		unregister_chrdev_region(0, 1);
-		return ret;
+		goto e_unlist;
 	}
-	cdev_add(ds5_cdev, *dev_num, 1);
-	atomic_inc(&primary_chardev);
+	/* Also the sensor subdevs' grp_id */
+	c->dev.devt = ctx->devt;
+	state->dfu_dev.cdev_ctx = ctx;
 	return 0;
+
+e_unlist:
+	mutex_lock(&ds5_dfu_cdevs_lock);
+	list_del(&ctx->node);
+	ds5_dfu_class_put();
+	mutex_unlock(&ds5_dfu_cdevs_lock);
+e_cdev:
+	cdev_del(ctx->cdev);
+e_region:
+	unregister_chrdev_region(ctx->devt, 1);
+e_free:
+	kfree(ctx);
+	return ret;
 };
 
-static int ds5_chrdev_remove(struct ds5 *state)
+static void ds5_chrdev_remove(struct ds5 *state)
 {
-	struct class **ds5_class = &state->dfu_dev.ds5_class;
-	dev_t *dev_num = &state->client->dev.devt;
-	if (!ds5_class) {
-		return 0;
-	}
+	struct ds5_dfu_cdev *ctx = state->dfu_dev.cdev_ctx;
+
+	if (!ctx)
+		return;
 	dev_dbg(&state->client->dev, "%s()\n", __func__);
-	unregister_chrdev_region(*dev_num, 1);
-	device_destroy(*ds5_class, *dev_num);
-	if (atomic_dec_and_test(&primary_chardev)) {
-		dev_warn(&state->client->dev, "%s() class_destroy\n", __func__);
-		class_destroy(*ds5_class);
-	}
-	return 0;
+	state->dfu_dev.cdev_ctx = NULL;
+
+	/* Waits for in-flight file ops; later ones get -ENODEV. */
+	down_write(&ctx->rwsem);
+	ctx->state = NULL;
+	up_write(&ctx->rwsem);
+
+	device_destroy(g_ds5_class, ctx->devt);
+	cdev_del(ctx->cdev);
+	unregister_chrdev_region(ctx->devt, 1);
+
+	mutex_lock(&ds5_dfu_cdevs_lock);
+	list_del(&ctx->node);
+	ds5_dfu_class_put();
+	mutex_unlock(&ds5_dfu_cdevs_lock);
+
+	kref_put(&ctx->ref, ds5_dfu_cdev_free);
 }
 
 /* SYSFS attributes */
@@ -10604,8 +10749,10 @@ static int ds5_probe(struct i2c_client *c
 	return 0;
 
 e_chardev:
-	if (state->dfu_dev.ds5_class)
-		ds5_chrdev_remove(state);
+	/* A DFU file op may wait for maintenance_sem under ctx->rwsem. */
+	ds5_dfu_read_unlock(&ds5_maintenance_sem);
+	ds5_chrdev_remove(state);
+	ds5_dfu_read_lock(&ds5_maintenance_sem);
 e_regulator:
 #ifdef CONFIG_VIDEO_D4XX_SERDES
 	/* Probe failure frees state, so SerDes must release its g_ctx first. */
@@ -10635,6 +10782,9 @@ static void ds5_remove(struct i2c_client *c)
 	if (state && !state->mux.sd.subdev.v4l2_dev) {
 		state = i2c_get_clientdata(c);
 	}
+
+	/* Stop DFU file ops before the session and hardware are torn down. */
+	ds5_chrdev_remove(state);
 
 	mutex_lock(&state->lock);
 	ds5_dfu_session_end(state);
@@ -10675,10 +10825,6 @@ static void ds5_remove(struct i2c_client *c)
 		sysfs_remove_group(&c->dev.kobj, &ds5_attr_group);
 #endif
 		ds5_mux_remove(state);
-	}
-
-	if (state->is_depth && state->dfu_dev.ds5_class) {
-		ds5_chrdev_remove(state);
 	}
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 12)
